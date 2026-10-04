@@ -1,0 +1,99 @@
+name: Render Busma video
+
+on:
+  workflow_dispatch:
+    inputs:
+      script_json:
+        description: "Video script as one-line JSON (scenes with voice lines)"
+        required: true
+        type: string
+      job_id:
+        description: "Job id coming from n8n (sent back with the result)"
+        required: true
+        type: string
+      scale:
+        description: "1 = full HD, 0.5 = fast preview"
+        required: false
+        default: "1"
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: busma-render-${{ inputs.job_id }}
+  cancel-in-progress: false
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      JOB_ID: ${{ inputs.job_id }}
+      CB_URL: ${{ secrets.N8N_CALLBACK_URL }}
+      CB_TOKEN: ${{ secrets.N8N_CALLBACK_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: System libraries
+        run: sudo apt-get update && sudo apt-get install -y libcairo2
+
+      - name: Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write the script file
+        env:
+          SCRIPT_JSON: ${{ inputs.script_json }}
+        run: |
+          mkdir -p job
+          printf '%s' "$SCRIPT_JSON" > job/video.json
+          python -c "import json; json.load(open('job/video.json', encoding='utf-8')); print('script ok')"
+
+      - name: Voice-over (ElevenLabs)
+        env:
+          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
+          ELEVENLABS_VOICE_ID: ${{ vars.ELEVENLABS_VOICE_ID || '9FHjCdVXgA4tYxIYHTcZ' }}
+        run: python make_audio.py job/video.json
+
+      - name: Render video
+        env:
+          SCALE: ${{ inputs.scale }}
+        run: python render.py job/video.json -o job/out.mp4 --scale "$SCALE" --workers "$(nproc)"
+
+      - name: Keep a copy for 3 days
+        uses: actions/upload-artifact@v4
+        with:
+          name: busma-${{ inputs.job_id }}
+          path: job/out.mp4
+          retention-days: 3
+
+      - name: Upload the video to a draft GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          TAG="busma-${JOB_ID}-r${{ github.run_number }}"
+          cp job/out.mp4 "job/${JOB_ID}.mp4"
+          gh release create "$TAG" "job/${JOB_ID}.mp4" --repo "$REPO" --draft --target "${{ github.sha }}" --title "$TAG" --notes "Busma video ${JOB_ID}"
+          API_URL=$(gh api "repos/${REPO}/releases?per_page=30" --jq ".[] | select(.tag_name==\"${TAG}\") | .url" | head -n1)
+          echo "RELEASE_API_URL=${API_URL}" >> "$GITHUB_ENV"
+
+      - name: Send the video to n8n
+        run: |
+          curl -sS --fail-with-body --retry 3 -X POST "$CB_URL" \
+            -H "X-Busma-Token: $CB_TOKEN" \
+            -F "job_id=$JOB_ID" -F "status=ok" -F "release_api_url=$RELEASE_API_URL" \
+            -F "video=@job/out.mp4;type=video/mp4" \
+            -F "script=@job/video.json;type=application/json"
+
+      - name: Tell n8n if something failed
+        if: failure()
+        run: |
+          curl -sS -X POST "$CB_URL" -H "X-Busma-Token: $CB_TOKEN" \
+            -F "job_id=$JOB_ID" -F "status=failed" \
+            -F "run_url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" || true
