@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-Split ONE voice-over recording (the whole script) into one file per scene, using the pauses
-between scenes.
+Split ONE voice-over recording (the whole script) into one file per scene.
 
     python split_audio.py job/video.json path/to/voice.mp3
 
-The recording needs a clear pause (about 2 seconds of silence) between scenes. It finds the speech
-parts, expects exactly one per scene that has a "voice" line, cuts them to audio/sN.wav next to
-the script JSON, and writes the file names into the JSON.
+How it works: it finds every pause in the recording, then chooses the pauses that best match the
+scene boundaries. The choice uses the length of each scene's voice text (a longer text gets more of
+the recording), so it does NOT depend on special long pauses. Long pauses (about 2 seconds) are
+preferred when they exist. Output: audio/sN.wav next to the script JSON, and the names are written
+into the JSON.
 """
-import json, os, re, subprocess, sys
+import itertools, json, os, re, subprocess, sys
 import imageio_ffmpeg
 
 FF = imageio_ffmpeg.get_ffmpeg_exe()
-MIN_SPEECH = 0.30   # ignore blips shorter than this (seconds)
 
 
 def total_length(path):
@@ -25,28 +25,25 @@ def total_length(path):
     return int(h) * 3600 + int(mn) * 60 + float(s)
 
 
-def speech_segments(path, total, noise_db, min_silence):
+def find_silences(path, total, noise_db, min_silence):
     r = subprocess.run([FF, '-i', path, '-af', f'silencedetect=noise={noise_db}dB:d={min_silence}',
                         '-f', 'null', '-'], capture_output=True, text=True)
-    silences, cur = [], None
+    out, cur = [], None
     for line in r.stderr.splitlines():
         m = re.search(r'silence_start:\s*(-?[\d.]+)', line)
         if m:
             cur = max(0.0, float(m.group(1)))
         m = re.search(r'silence_end:\s*(-?[\d.]+)', line)
         if m and cur is not None:
-            silences.append((cur, float(m.group(1))))
+            out.append((cur, float(m.group(1))))
             cur = None
     if cur is not None:
-        silences.append((cur, total))
-    segs, pos = [], 0.0
-    for s, e in silences:
-        if s - pos >= MIN_SPEECH:
-            segs.append((pos, s))
-        pos = e
-    if total - pos >= MIN_SPEECH:
-        segs.append((pos, total))
-    return segs
+        out.append((cur, total))
+    return out
+
+
+def weight(text):
+    return max(1, len(re.sub(r'[\W_]+', '', text)))
 
 
 def main():
@@ -61,30 +58,57 @@ def main():
     n = len(idx)
     total = total_length(vpath)
 
-    chosen, tried = None, []
-    for noise in (-35, -40, -30, -45):
-        for gap in (1.4, 1.1, 1.8, 0.9, 2.2, 0.7):
-            segs = speech_segments(vpath, total, noise, gap)
-            tried.append(len(segs))
-            if len(segs) == n:
-                chosen = segs
-                break
-        if chosen:
+    # speech region (ignore leading and trailing silence)
+    sil = []
+    for noise, gap in ((-35, 0.35), (-35, 0.25), (-30, 0.25), (-40, 0.2)):
+        sil = find_silences(vpath, total, noise, gap)
+        inner = [(a, b) for a, b in sil if a > 0.15 and b < total - 0.15]
+        if len(inner) >= n - 1:
             break
-    if not chosen:
-        sys.exit(f'Found {sorted(set(tried))} speech parts, but the script has {n} scenes with voice. '
-                 f'Leave a clear pause of about 2 seconds between scenes and send the recording again.')
+    lead = sil[0][1] if sil and sil[0][0] <= 0.15 else 0.0
+    tail = sil[-1][0] if sil and sil[-1][1] >= total - 0.15 else total
+    inner = [(a, b) for a, b in sil if a > 0.15 and b < total - 0.15]
+    if len(inner) < n - 1:
+        sys.exit(f'Found only {len(inner)} pauses in the recording, but the script has {n} scenes. '
+                 f'Leave a short pause between scenes and send the recording again.')
 
+    texts = [cfg['scenes'][i]['voice'] for i in idx]
+    wts = [weight(t) for t in texts]
+    speech = max(0.1, tail - lead)
+    # expected cut positions from text length
+    exp, acc = [], 0
+    for w in wts[:-1]:
+        acc += w
+        exp.append(lead + speech * acc / sum(wts))
+
+    best, best_cost = None, None
+    if n == 1:
+        best = ()
+    else:
+        for combo in itertools.combinations(range(len(inner)), n - 1):
+            cost = 0.0
+            for k, ci in enumerate(combo):
+                a, b = inner[ci]
+                cost += abs((a + b) / 2 - exp[k]) - 1.5 * (b - a)
+            if best_cost is None or cost < best_cost:
+                best, best_cost = combo, cost
+
+    bounds = [(lead, None)]
+    cuts = [inner[ci] for ci in best]
+    starts = [lead] + [b for a, b in cuts]
+    ends = [a for a, b in cuts] + [tail]
     os.makedirs(os.path.join(base, 'audio'), exist_ok=True)
-    for (a, b), i in zip(chosen, idx):
+    for (a, b), i in zip(zip(starts, ends), idx):
+        if b - a < 0.5:
+            sys.exit(f'Scene {i + 1} came out only {b - a:.1f}s long. Check the recording matches the script.')
         rel = f'audio/s{i + 1}.wav'
-        r = subprocess.run([FF, '-y', '-ss', f'{max(0.0, a - 0.06):.3f}', '-to', f'{min(total, b + 0.10):.3f}',
+        r = subprocess.run([FF, '-y', '-ss', f'{max(0.0, a - 0.05):.3f}', '-to', f'{min(total, b + 0.12):.3f}',
                             '-i', vpath, '-c:a', 'pcm_s16le', '-ar', '44100', os.path.join(base, rel)],
                            capture_output=True, text=True)
         if r.returncode != 0:
             sys.exit('ffmpeg failed:\n' + r.stderr[-800:])
         cfg['scenes'][i]['audio'] = rel
-        print(f'scene {i + 1}: {b - a:.1f}s -> {rel}')
+        print(f'scene {i + 1}: {a:.1f}s -> {b:.1f}s ({b - a:.1f}s) -> {rel}')
     json.dump(cfg, open(jpath, 'w', encoding='utf-8'), ensure_ascii=False, indent=1)
     print(f'split {n} scenes')
 
