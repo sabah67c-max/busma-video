@@ -16,6 +16,16 @@ on:
         required: false
         default: "1"
         type: string
+      voice_mode:
+        description: "elevenlabs = generate the voice | file = use my recording | none = silent video"
+        required: false
+        default: "elevenlabs"
+        type: string
+      voice_path:
+        description: "For voice_mode=file: path of the recording inside the repo, e.g. jobs/test-1/voice.mp3"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: write
@@ -55,10 +65,17 @@ jobs:
           python -c "import json; json.load(open('job/video.json', encoding='utf-8')); print('script ok')"
 
       - name: Voice-over (ElevenLabs)
+        if: ${{ inputs.voice_mode == 'elevenlabs' }}
         env:
           ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
           ELEVENLABS_VOICE_ID: ${{ vars.ELEVENLABS_VOICE_ID || '9FHjCdVXgA4tYxIYHTcZ' }}
         run: python make_audio.py job/video.json
+
+      - name: Voice-over from my recording
+        if: ${{ inputs.voice_mode == 'file' }}
+        env:
+          VOICE_PATH: ${{ inputs.voice_path }}
+        run: python split_audio.py job/video.json "$VOICE_PATH"
 
       - name: Render video
         env:
